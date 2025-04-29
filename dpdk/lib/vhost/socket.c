@@ -23,6 +23,7 @@
 #include "vhost.h"
 #include "vhost_user.h"
 
+#define RECONNS_PER_ITERATION 32
 
 TAILQ_HEAD(vhost_user_connection_list, vhost_user_connection);
 
@@ -460,6 +461,7 @@ vhost_user_connect_nonblock(char *path, int fd, struct sockaddr *un, size_t sz)
 static void *
 vhost_user_client_reconnect(void *arg __rte_unused)
 {
+#if 0
 	int ret;
 	struct vhost_user_reconnect *reconn, *next;
 
@@ -497,6 +499,62 @@ remove_fd:
 		pthread_mutex_unlock(&reconn_list.mutex);
 		sleep(1);
 	}
+#endif
+
+	int ret;
+	struct vhost_user_reconnect *reconn;
+	struct vhost_user_reconnect *reconns[RECONNS_PER_ITERATION];
+	struct vhost_user_reconnect *reconns_free[RECONNS_PER_ITERATION];
+	int reconns_count;
+	int reconns_free_count;
+
+	while (1) {
+		/* Make a snapshot of reconns */
+		reconns_count = 0;
+		pthread_mutex_lock(&reconn_list.mutex);
+		TAILQ_FOREACH(reconn, &reconn_list.head, next) {
+			if (reconns_count == RECONNS_PER_ITERATION) {
+				break;
+			}
+			reconns[reconns_count++] = reconn;
+		}
+		pthread_mutex_unlock(&reconn_list.mutex);
+
+		/* Do reconnect for all reconns */
+		reconns_free_count = 0;
+		for (int i = 0; i < reconns_count; i++) {
+			reconn = reconns[i];
+
+			ret = vhost_user_connect_nonblock(reconn->vsocket->path, reconn->fd,
+						(struct sockaddr *)&reconn->un,
+						sizeof(reconn->un));
+			if (ret == -2) {
+				close(reconn->fd);
+				VHOST_LOG_CONFIG(reconn->vsocket->path, ERR,
+					"reconnection for fd %d failed\n",
+					reconn->fd);
+				goto remove_fd;
+			}
+			if (ret == -1)
+				continue;
+
+			VHOST_LOG_CONFIG(reconn->vsocket->path, INFO, "connected\n");
+			vhost_user_add_connection(reconn->fd, reconn->vsocket);
+remove_fd:
+			reconns_free[reconns_free_count++] = reconn;
+		}
+
+		/* Free reconns */
+		pthread_mutex_lock(&reconn_list.mutex);
+		for (int i = 0; i < reconns_free_count; i++) {
+			reconn = reconns_free[i];
+			TAILQ_REMOVE(&reconn_list.head, reconn, next);
+			free(reconn);
+		}
+		pthread_mutex_unlock(&reconn_list.mutex);
+
+		sleep(1);
+	}
 
 	return NULL;
 }
@@ -529,11 +587,18 @@ vhost_user_reconnect_init(void)
 static int
 vhost_user_start_client(struct vhost_user_socket *vsocket)
 {
+	// Unused variable.
+#if 0
 	int ret;
+#endif
 	int fd = vsocket->socket_fd;
 	const char *path = vsocket->path;
 	struct vhost_user_reconnect *reconn;
 
+	// Remove this block of code, as it can cause a deadlock.
+	// Actually, the code below does the same stuff asynchronously in the dedicated thread.
+	// So, this asynchrony helps to avoid the deadlock.
+#if 0
 	ret = vhost_user_connect_nonblock(vsocket->path, fd, (struct sockaddr *)&vsocket->un,
 					  sizeof(vsocket->un));
 	if (ret == 0) {
@@ -549,6 +614,7 @@ vhost_user_start_client(struct vhost_user_socket *vsocket)
 	}
 
 	VHOST_LOG_CONFIG(path, INFO, "reconnecting...\n");
+#endif
 	reconn = malloc(sizeof(*reconn));
 	if (reconn == NULL) {
 		VHOST_LOG_CONFIG(path, ERR, "failed to allocate memory for reconnect\n");

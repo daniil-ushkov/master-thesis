@@ -340,6 +340,62 @@ int spdk_vhost_blk_construct(const char *name, const char *cpumask, const char *
  */
 int spdk_vhost_dev_remove(struct spdk_vhost_dev *vdev);
 
+/**
+ * Construct a vhost blk device.  This will create a Unix domain
+ * socket together with a vhost-user slave server waiting for a
+ * connection on this socket. Creating the vdev does not start
+ * any I/O pollers and does not hog the CPU. I/O processing starts
+ * after receiving proper message on the created socket.
+ * See QEMU's vhost-user documentation for details. Vhost blk
+ * device is tightly associated with given SPDK bdev. Given
+ * bdev can not be changed, unless it has been hotremoved. This
+ * would result in all I/O failing with virtio \c VIRTIO_BLK_S_IOERR
+ * error code.
+ *
+ * This function is thread-safe.
+ *
+ * \param name name of the vhost blk device. The name will also be
+ * used for socket name, which is exactly \c socket_base_dir/name
+ * \param cpumask string containing cpumask in hex. The leading *0x*
+ * is allowed but not required. The mask itself can be constructed as:
+ * ((1 << cpu0) | (1 << cpu1) | ... | (1 << cpuN)).
+ * \param dev_name bdev name to associate with this vhost device
+ * \param transport virtio blk transport name (default: vhost_user_blk)
+ * \param params JSON value object containing variables:
+ * readonly if set, all writes to the device will fail with
+ * \param client start blk in client mode.
+ * \c VIRTIO_BLK_S_IOERR error code.
+ * packed_ring this controller supports packed ring if set.
+ *
+ * \return 0 on success, negative errno on error.
+ */
+int spdk_vhost_blk_construct_client(const char *name, const char *cpumask, const char *dev_name,
+			     const char *transport, bool client, const struct spdk_json_val *params);
+
+/**
+ * Construct an empty vhost SCSI device.  This will create a
+ * Unix domain socket together with a vhost-user slave server waiting
+ * for a connection on this socket. Creating the vdev does not
+ * start any I/O pollers and does not hog the CPU. I/O processing
+ * starts after receiving proper message on the created socket.
+ * See QEMU's vhost-user documentation for details.
+ * All physical devices have to be separately attached to this
+ * vdev via \c spdk_vhost_scsi_dev_add_tgt().
+ *
+ * This function is thread-safe.
+ *
+ * \param name name of the vhost device. The name will also be used
+ * for socket name, which is exactly \c socket_base_dir/name
+ * \param cpumask string containing cpumask in hex. The leading *0x*
+ * is allowed but not required. The mask itself can be constructed as:
+ * ((1 << cpu0) | (1 << cpu1) | ... | (1 << cpuN)).
+ * \param delay delay start scsi of block device.
+ * \param client start scsi block device in client mode.
+ *
+ * \return 0 on success, negative errno on error.
+ */
+int spdk_vhost_scsi_dev_construct_client(const char *name, const char *cpumask, bool delay, bool client);
+
 #ifdef __cplusplus
 }
 #endif

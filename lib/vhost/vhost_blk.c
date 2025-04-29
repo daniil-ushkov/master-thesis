@@ -1826,3 +1826,71 @@ SPDK_VIRTIO_BLK_TRANSPORT_REGISTER(vhost_user_blk, &vhost_user_blk);
 
 SPDK_LOG_REGISTER_COMPONENT(vhost_blk)
 SPDK_LOG_REGISTER_COMPONENT(vhost_blk_data)
+
+int
+spdk_vhost_blk_construct_client(const char *name, const char *cpumask, const char *dev_name,
+			 const char *transport, bool client, const struct spdk_json_val *params)
+{
+	struct spdk_vhost_blk_dev *bvdev = NULL;
+	struct spdk_vhost_dev *vdev;
+	struct spdk_bdev *bdev;
+	const char *transport_name = VIRTIO_BLK_DEFAULT_TRANSPORT;
+	int ret = 0;
+
+	bvdev = calloc(1, sizeof(*bvdev));
+	if (bvdev == NULL) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	if (transport != NULL) {
+		transport_name = transport;
+	}
+
+	bvdev->ops = virtio_blk_get_transport_ops(transport_name);
+	if (!bvdev->ops) {
+		ret = -EINVAL;
+		SPDK_ERRLOG("Transport type '%s' unavailable.\n", transport_name);
+		goto out;
+	}
+
+	ret = spdk_bdev_open_ext(dev_name, true, bdev_event_cb, bvdev, &bvdev->bdev_desc);
+	if (ret != 0) {
+		SPDK_ERRLOG("%s: could not open bdev '%s', error=%d\n",
+			    name, dev_name, ret);
+		goto out;
+	}
+	bdev = spdk_bdev_desc_get_bdev(bvdev->bdev_desc);
+
+	vdev = &bvdev->vdev;
+	vdev->virtio_features = SPDK_VHOST_BLK_FEATURES_BASE;
+	vdev->disabled_features = SPDK_VHOST_BLK_DISABLED_FEATURES;
+	vdev->protocol_features = SPDK_VHOST_BLK_PROTOCOL_FEATURES;
+
+	if (spdk_bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_UNMAP)) {
+		vdev->virtio_features |= (1ULL << VIRTIO_BLK_F_DISCARD);
+	}
+	if (spdk_bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_WRITE_ZEROES)) {
+		vdev->virtio_features |= (1ULL << VIRTIO_BLK_F_WRITE_ZEROES);
+	}
+
+	if (spdk_bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_FLUSH)) {
+		vdev->virtio_features |= (1ULL << VIRTIO_BLK_F_FLUSH);
+	}
+
+	bvdev->bdev = bdev;
+	bvdev->readonly = false;
+	ret = vhost_dev_register(vdev, name, cpumask, params, &vhost_blk_device_backend,
+				 &vhost_blk_user_device_backend, false);
+	if (ret != 0) {
+		spdk_bdev_close(bvdev->bdev_desc);
+		goto out;
+	}
+
+	SPDK_INFOLOG(vhost, "%s: using bdev '%s'\n", name, dev_name);
+out:
+	if (ret != 0 && bvdev) {
+		free(bvdev);
+	}
+	return ret;
+}
