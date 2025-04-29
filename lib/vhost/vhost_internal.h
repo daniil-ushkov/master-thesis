@@ -205,6 +205,7 @@ struct spdk_vhost_dev {
 	uint64_t virtio_features;
 	uint64_t disabled_features;
 	uint64_t protocol_features;
+	bool client;
 
 	const struct spdk_vhost_dev_backend *backend;
 
@@ -629,6 +630,9 @@ const struct spdk_virtio_blk_transport_ops *virtio_blk_get_transport_ops(
 	const char *transport_name);
 
 void vhost_session_info_json(struct spdk_vhost_dev *vdev, struct spdk_json_write_ctx *w);
+
+int vhost_register_unix_socket_client(const char *path, const char *ctrl_name,
+			       uint64_t virtio_features, uint64_t disabled_features, uint64_t protocol_features, bool client);
 
 /*
  * Macro used to register new transports.

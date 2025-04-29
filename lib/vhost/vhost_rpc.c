@@ -19,6 +19,7 @@ struct rpc_vhost_scsi_ctrlr {
 	char *ctrlr;
 	char *cpumask;
 	bool delay;
+	bool client;
 };
 
 static void
@@ -32,6 +33,7 @@ static const struct spdk_json_object_decoder rpc_vhost_create_scsi_ctrlr[] = {
 	{"ctrlr", offsetof(struct rpc_vhost_scsi_ctrlr, ctrlr), spdk_json_decode_string },
 	{"cpumask", offsetof(struct rpc_vhost_scsi_ctrlr, cpumask), spdk_json_decode_string, true},
 	{"delay", offsetof(struct rpc_vhost_scsi_ctrlr, delay), spdk_json_decode_bool, true},
+	{"client", offsetof(struct rpc_vhost_scsi_ctrlr, client), spdk_json_decode_bool, true},
 };
 
 static void
@@ -49,11 +51,8 @@ rpc_vhost_create_scsi_controller(struct spdk_jsonrpc_request *request,
 		goto invalid;
 	}
 
-	if (req.delay) {
-		rc = spdk_vhost_scsi_dev_construct_no_start(req.ctrlr, req.cpumask);
-	} else {
-		rc = spdk_vhost_scsi_dev_construct(req.ctrlr, req.cpumask);
-	}
+	rc = spdk_vhost_scsi_dev_construct_client(req.ctrlr, req.cpumask, req.delay, req.client);
+
 	if (rc < 0) {
 		goto invalid;
 	}
@@ -257,6 +256,7 @@ struct rpc_vhost_blk_ctrlr {
 	char *dev_name;
 	char *cpumask;
 	char *transport;
+	bool client;
 };
 
 static const struct spdk_json_object_decoder rpc_construct_vhost_blk_ctrlr[] = {
@@ -264,6 +264,7 @@ static const struct spdk_json_object_decoder rpc_construct_vhost_blk_ctrlr[] = {
 	{"dev_name", offsetof(struct rpc_vhost_blk_ctrlr, dev_name), spdk_json_decode_string },
 	{"cpumask", offsetof(struct rpc_vhost_blk_ctrlr, cpumask), spdk_json_decode_string, true},
 	{"transport", offsetof(struct rpc_vhost_blk_ctrlr, transport), spdk_json_decode_string, true},
+	{"client", offsetof(struct rpc_vhost_blk_ctrlr, client), spdk_json_decode_bool, true},
 };
 
 static void
@@ -290,7 +291,13 @@ rpc_vhost_create_blk_controller(struct spdk_jsonrpc_request *request,
 		goto invalid;
 	}
 
-	rc = spdk_vhost_blk_construct(req.ctrlr, req.cpumask, req.dev_name, req.transport, params);
+	if (req.client) {
+		SPDK_INFOLOG(vhost_rpc, "create vhost blk controller %s in client mode\n", req.ctrlr);
+	} else {
+		SPDK_INFOLOG(vhost_rpc, "create vhost blk controller %s in server mode\n", req.ctrlr);
+	}
+
+	rc = spdk_vhost_blk_construct_client(req.ctrlr, req.cpumask, req.dev_name, req.transport, req.client, params);
 	if (rc < 0) {
 		goto invalid;
 	}

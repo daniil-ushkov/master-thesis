@@ -1662,3 +1662,33 @@ vhost_scsi_write_config_json(struct spdk_vhost_dev *vdev, struct spdk_json_write
 SPDK_LOG_REGISTER_COMPONENT(vhost_scsi)
 SPDK_LOG_REGISTER_COMPONENT(vhost_scsi_queue)
 SPDK_LOG_REGISTER_COMPONENT(vhost_scsi_data)
+
+int
+spdk_vhost_scsi_dev_construct_client(const char *name, const char *cpumask, bool delay, bool client)
+{
+	struct spdk_vhost_scsi_dev *svdev = calloc(1, sizeof(*svdev));
+	int rc;
+
+	if (svdev == NULL) {
+		return -ENOMEM;
+	}
+
+	svdev->vdev.virtio_features = SPDK_VHOST_SCSI_FEATURES;
+	svdev->vdev.disabled_features = SPDK_VHOST_SCSI_DISABLED_FEATURES;
+	svdev->vdev.protocol_features = SPDK_VHOST_SCSI_PROTOCOL_FEATURES;
+	svdev->vdev.client = client;
+
+	rc = vhost_dev_register(&svdev->vdev, name, cpumask, NULL,
+				&spdk_vhost_scsi_device_backend,
+				&spdk_vhost_scsi_user_device_backend, delay);
+	if (rc) {
+		free(svdev);
+		return rc;
+	}
+
+	if (delay == false) {
+		svdev->registered = true;
+	}
+
+	return rc;
+}

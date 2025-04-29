@@ -1604,6 +1604,8 @@ int
 vhost_register_unix_socket(const char *path, const char *ctrl_name,
 			   uint64_t virtio_features, uint64_t disabled_features, uint64_t protocol_features)
 {
+	// Fallback to vhost_register_unix_socket_client instead.
+#if 0
 	struct stat file_stat;
 	uint64_t features = 0;
 	uint64_t flags = 0;
@@ -1655,6 +1657,8 @@ vhost_register_unix_socket(const char *path, const char *ctrl_name,
 	}
 
 	return 0;
+#endif
+	return vhost_register_unix_socket_client(path, ctrl_name, virtio_features, disabled_features, protocol_features, false);
 }
 
 int
@@ -2016,4 +2020,66 @@ vhost_session_info_json(struct spdk_vhost_dev *vdev, struct spdk_json_write_ctx 
 		spdk_json_write_object_end(w);
 	}
 	pthread_mutex_unlock(&user_dev->lock);
+}
+
+int
+vhost_register_unix_socket_client(const char *path, const char *ctrl_name,
+			   uint64_t virtio_features, uint64_t disabled_features, uint64_t protocol_features, bool client)
+{
+	struct stat file_stat;
+	uint64_t features = 0;
+	uint64_t flags = 0;
+
+	/* Register vhost driver to handle vhost messages. */
+	if (!client && stat(path, &file_stat) != -1) {
+		if (!S_ISSOCK(file_stat.st_mode)) {
+			SPDK_ERRLOG("Cannot create a domain socket at path \"%s\": "
+				    "The file already exists and is not a socket.\n",
+				    path);
+			return -EIO;
+		} else if (unlink(path) != 0) {
+			SPDK_ERRLOG("Cannot create a domain socket at path \"%s\": "
+				    "The socket already exists and failed to unlink.\n",
+				    path);
+			return -EIO;
+		}
+	}
+
+#if RTE_VERSION < RTE_VERSION_NUM(20, 8, 0, 0)
+	if (rte_vhost_driver_register(path, flags) != 0) {
+#else
+	flags = spdk_iommu_is_enabled() ? 0 : RTE_VHOST_USER_ASYNC_COPY;
+	flags |= client ? RTE_VHOST_USER_CLIENT : 0;
+	if (rte_vhost_driver_register(path, flags) != 0) {
+#endif
+		SPDK_ERRLOG("Could not register controller %s with vhost library\n", ctrl_name);
+		SPDK_ERRLOG("Check if domain socket %s already exists\n", path);
+		return -EIO;
+	}
+	if (rte_vhost_driver_set_features(path, virtio_features) ||
+	    rte_vhost_driver_disable_features(path, disabled_features)) {
+		SPDK_ERRLOG("Couldn't set vhost features for controller %s\n", ctrl_name);
+
+		rte_vhost_driver_unregister(path);
+		return -EIO;
+	}
+
+	if (rte_vhost_driver_callback_register(path, &g_spdk_vhost_ops) != 0) {
+		rte_vhost_driver_unregister(path);
+		SPDK_ERRLOG("Couldn't register callbacks for controller %s\n", ctrl_name);
+		return -EIO;
+	}
+
+	rte_vhost_driver_get_protocol_features(path, &features);
+	features |= protocol_features;
+	rte_vhost_driver_set_protocol_features(path, features);
+
+	if (rte_vhost_driver_start(path) != 0) {
+		SPDK_ERRLOG("Failed to start vhost driver for controller %s (%d): %s\n",
+			    ctrl_name, errno, spdk_strerror(errno));
+		rte_vhost_driver_unregister(path);
+		return -EIO;
+	}
+
+	return 0;
 }

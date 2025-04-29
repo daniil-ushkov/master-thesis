@@ -529,11 +529,18 @@ vhost_user_reconnect_init(void)
 static int
 vhost_user_start_client(struct vhost_user_socket *vsocket)
 {
+	// Unused variable.
+#if 0
 	int ret;
+#endif
 	int fd = vsocket->socket_fd;
 	const char *path = vsocket->path;
 	struct vhost_user_reconnect *reconn;
 
+	// Remove this block of code, as it can cause a deadlock.
+	// Actually, the code below does the same stuff asynchronously in the dedicated thread.
+	// So, this asynchrony helps to avoid the deadlock.
+#if 0
 	ret = vhost_user_connect_nonblock(vsocket->path, fd, (struct sockaddr *)&vsocket->un,
 					  sizeof(vsocket->un));
 	if (ret == 0) {
@@ -549,6 +556,7 @@ vhost_user_start_client(struct vhost_user_socket *vsocket)
 	}
 
 	VHOST_LOG_CONFIG(path, INFO, "reconnecting...\n");
+#endif
 	reconn = malloc(sizeof(*reconn));
 	if (reconn == NULL) {
 		VHOST_LOG_CONFIG(path, ERR, "failed to allocate memory for reconnect\n");
