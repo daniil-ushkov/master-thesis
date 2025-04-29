@@ -311,10 +311,12 @@ SPDK_RPC_REGISTER("vhost_create_blk_controller", rpc_vhost_create_blk_controller
 
 struct rpc_delete_vhost_ctrlr {
 	char *ctrlr;
+	bool force;
 };
 
 static const struct spdk_json_object_decoder rpc_delete_vhost_ctrlr_decoder[] = {
 	{"ctrlr", offsetof(struct rpc_delete_vhost_ctrlr, ctrlr), spdk_json_decode_string },
+	{"force", offsetof(struct rpc_delete_vhost_ctrlr, force), spdk_json_decode_bool, true /* opt */ },
 };
 
 static void
@@ -323,12 +325,124 @@ free_rpc_delete_vhost_ctrlr(struct rpc_delete_vhost_ctrlr *req)
 	free(req->ctrlr);
 }
 
-struct vhost_delete_ctrlr_context {
+struct delete_controller_ctx {
+	struct spdk_vhost_user_dev *user_dev;
+	char *name;
 	struct spdk_jsonrpc_request *request;
-	const struct spdk_json_val *params;
+
+	#define DELETE_SESSIONS_RETRY_LIMIT 1000
+	#define DELETE_SESSIONS_PERIOD_MICROS 5000
+	int delete_sessions_retry_cnt;
+	struct spdk_poller *delete_sessions_poller;
+
+	#define DELETE_CONTROLLER_RETRY_LIMIT 1000
+	#define DELETE_CONTROLLER_PERIOD_MICROS 5000
+	int delete_controller_retry_cnt;
+	struct spdk_poller *delete_controller_poller;
 };
 
-static void _rpc_vhost_delete_controller(void *arg);
+static struct delete_controller_ctx *
+delete_controller_ctx_alloc(struct spdk_vhost_user_dev *user_dev, struct spdk_jsonrpc_request *request)
+{
+	struct delete_controller_ctx *ctx = malloc(sizeof(struct delete_controller_ctx));
+	ctx->user_dev = user_dev;
+	ctx->name = strdup(user_dev->vdev->name);
+	ctx->request = request;
+	return ctx;
+}
+
+static void
+delete_controller_ctx_free(struct delete_controller_ctx *ctx)
+{
+	free(ctx->name);
+	free(ctx);
+}
+
+static int
+delete_controller(void* arg)
+{
+	struct delete_controller_ctx *ctx = arg;
+	struct spdk_vhost_user_dev *user_dev = ctx->user_dev;
+	struct spdk_vhost_dev *vdev = ctx->user_dev->vdev;
+	char *name = ctx->name;
+	struct spdk_jsonrpc_request *request = ctx->request;
+	int rc;
+
+	if (ctx->delete_controller_retry_cnt == 0) {
+		SPDK_ERRLOG("%s: retry limit exceeded on delete controller\n", vdev->name);
+		spdk_poller_unregister(&ctx->delete_controller_poller);
+		delete_controller_ctx_free(ctx);
+		return SPDK_POLLER_BUSY;
+	}
+	ctx->delete_controller_retry_cnt--;
+
+	SPDK_INFOLOG(vhost_rpc, "%s: delete controller\n", vdev->name);
+	rc = spdk_vhost_dev_remove(user_dev->vdev);
+	switch (rc)
+	{
+	case 0:
+		SPDK_INFOLOG(vhost_rpc, "%s: controller is deleted\n", name);
+		spdk_poller_unregister(&ctx->delete_controller_poller);
+		delete_controller_ctx_free(ctx);
+		spdk_jsonrpc_send_bool_response(request, true);
+		break;
+	case -EBUSY:
+		SPDK_INFOLOG(vhost_rpc, "%s: retry to delete controller\n", name);
+		break;
+	default:
+		SPDK_ERRLOG("%s: internal error occurred during the deleting contoller: %s\n", name, spdk_strerror(-rc));
+		spdk_poller_unregister(&ctx->delete_controller_poller);
+		delete_controller_ctx_free(ctx);
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+				spdk_strerror(-rc));
+		break;
+	}
+
+	return SPDK_POLLER_BUSY;
+}
+
+static int
+delete_sessions(void* arg)
+{
+	struct delete_controller_ctx *ctx = arg;
+	struct spdk_vhost_dev *vdev = ctx->user_dev->vdev;
+	char *name = ctx->name;
+	struct spdk_jsonrpc_request *request = ctx->request;
+	int rc;
+
+	if (ctx->delete_sessions_retry_cnt == 0) {
+		SPDK_ERRLOG("%s: retry limit exceeded on queue delete sessions request\n", vdev->name);
+		spdk_poller_unregister(&ctx->delete_sessions_poller);
+		delete_controller_ctx_free(ctx);
+		return SPDK_POLLER_BUSY;
+	}
+	ctx->delete_sessions_retry_cnt--;
+
+	SPDK_INFOLOG(vhost_rpc, "%s: queue delete sessions request\n", vdev->name);
+	rc = rte_vhost_driver_unregister(vdev->path);
+	switch (rc)
+	{
+	case 0:
+		SPDK_INFOLOG(vhost_rpc, "%s: delete sessions request is queued\n", name);
+		spdk_poller_unregister(&ctx->delete_sessions_poller);
+		ctx->delete_controller_retry_cnt = DELETE_CONTROLLER_RETRY_LIMIT;
+		ctx->delete_controller_poller = SPDK_POLLER_REGISTER(delete_controller, arg,
+			DELETE_CONTROLLER_PERIOD_MICROS);
+		break;
+	case -EAGAIN:
+		SPDK_INFOLOG(vhost_rpc, "%s: retry to queue delete sessions request\n", name);
+		break;
+	default:
+		SPDK_ERRLOG("%s: internal error occurred during the queueing delete sessions request: %s\n", name, spdk_strerror(-rc));
+		spdk_poller_unregister(&ctx->delete_sessions_poller);
+		delete_controller_ctx_free(ctx);
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+				spdk_strerror(-rc));
+		break;
+	}
+
+	return SPDK_POLLER_BUSY;
+}
 
 static void
 rpc_vhost_delete_controller(struct spdk_jsonrpc_request *request,
@@ -336,6 +450,8 @@ rpc_vhost_delete_controller(struct spdk_jsonrpc_request *request,
 {
 	struct rpc_delete_vhost_ctrlr req = {0};
 	struct spdk_vhost_dev *vdev;
+	struct spdk_vhost_user_dev *user_dev;
+	struct delete_controller_ctx *ctx;
 	int rc;
 
 	if (spdk_json_decode_object(params, rpc_delete_vhost_ctrlr_decoder,
@@ -354,23 +470,21 @@ rpc_vhost_delete_controller(struct spdk_jsonrpc_request *request,
 	}
 	spdk_vhost_unlock();
 
+	if (req.force) {
+		SPDK_INFOLOG(vhost_rpc, "%s: start force deleting of contoller\n", vdev->name);
+
+		user_dev = to_user_dev(vdev);
+		ctx = delete_controller_ctx_alloc(user_dev, request);
+		ctx->delete_sessions_retry_cnt = DELETE_SESSIONS_RETRY_LIMIT;
+		ctx->delete_sessions_poller = SPDK_POLLER_REGISTER(delete_sessions, ctx,
+			DELETE_SESSIONS_PERIOD_MICROS);
+
+		free_rpc_delete_vhost_ctrlr(&req);
+		return;
+	}
+
 	rc = spdk_vhost_dev_remove(vdev);
 	if (rc < 0) {
-		if (rc == -EBUSY) {
-			struct vhost_delete_ctrlr_context *ctx;
-
-			ctx = calloc(1, sizeof(*ctx));
-			if (ctx == NULL) {
-				SPDK_ERRLOG("Failed to allocate memory for vhost_delete_ctrlr context\n");
-				rc = -ENOMEM;
-				goto invalid;
-			}
-			ctx->request = request;
-			ctx->params = params;
-			spdk_thread_send_msg(spdk_get_thread(), _rpc_vhost_delete_controller, ctx);
-			free_rpc_delete_vhost_ctrlr(&req);
-			return;
-		}
 		goto invalid;
 	}
 
@@ -386,14 +500,6 @@ invalid:
 
 }
 SPDK_RPC_REGISTER("vhost_delete_controller", rpc_vhost_delete_controller, SPDK_RPC_RUNTIME)
-
-static void _rpc_vhost_delete_controller(void *arg)
-{
-	struct vhost_delete_ctrlr_context *ctx = arg;
-
-	rpc_vhost_delete_controller(ctx->request, ctx->params);
-	free(ctx);
-}
 
 struct rpc_get_vhost_ctrlrs {
 	char *name;

@@ -65,6 +65,9 @@ struct vhost_user_socket {
 
 	struct rte_vhost_device_ops const *notify_ops;
 	struct rte_vhost_device_ops *malloc_notify_ops;
+
+	// guarded with vhost_user.mutex
+	bool delete;
 };
 
 struct vhost_user_connection {
@@ -81,6 +84,16 @@ struct vhost_user {
 	struct fdset fdset;
 	int vsocket_cnt;
 	pthread_mutex_t mutex;
+
+	union {
+		struct {
+			int fds[2];
+		};
+		struct {
+			int readfd;
+			int writefd;
+		};
+	} socket_delete_notifier;
 };
 
 #define MAX_VIRTIO_BACKLOG 128
@@ -1036,7 +1049,12 @@ out:
 	return ret;
 }
 
+// TODO: may be used in client mode.
 static bool
+vhost_user_remove_reconnect(struct vhost_user_socket *vsocket)
+__attribute__((unused));
+
+bool
 vhost_user_remove_reconnect(struct vhost_user_socket *vsocket)
 {
 	int found = false;
@@ -1058,89 +1076,6 @@ vhost_user_remove_reconnect(struct vhost_user_socket *vsocket)
 	}
 	pthread_mutex_unlock(&reconn_list.mutex);
 	return found;
-}
-
-/**
- * Unregister the specified vhost socket
- */
-int
-rte_vhost_driver_unregister(const char *path)
-{
-	int i;
-	int count;
-	struct vhost_user_connection *conn, *next;
-
-	if (path == NULL)
-		return -1;
-
-again:
-	pthread_mutex_lock(&vhost_user.mutex);
-
-	for (i = 0; i < vhost_user.vsocket_cnt; i++) {
-		struct vhost_user_socket *vsocket = vhost_user.vsockets[i];
-		if (strcmp(vsocket->path, path))
-			continue;
-
-		if (vsocket->is_vduse) {
-			vduse_device_destroy(path);
-		} else if (vsocket->is_server) {
-			/*
-			 * If r/wcb is executing, release vhost_user's
-			 * mutex lock, and try again since the r/wcb
-			 * may use the mutex lock.
-			 */
-			if (fdset_try_del(&vhost_user.fdset, vsocket->socket_fd) == -1) {
-				pthread_mutex_unlock(&vhost_user.mutex);
-				goto again;
-			}
-		} else if (vsocket->reconnect) {
-			vhost_user_remove_reconnect(vsocket);
-		}
-
-		pthread_mutex_lock(&vsocket->conn_mutex);
-		for (conn = TAILQ_FIRST(&vsocket->conn_list);
-			 conn != NULL;
-			 conn = next) {
-			next = TAILQ_NEXT(conn, next);
-
-			/*
-			 * If r/wcb is executing, release vsocket's
-			 * conn_mutex and vhost_user's mutex locks, and
-			 * try again since the r/wcb may use the
-			 * conn_mutex and mutex locks.
-			 */
-			if (fdset_try_del(&vhost_user.fdset,
-					  conn->connfd) == -1) {
-				pthread_mutex_unlock(&vsocket->conn_mutex);
-				pthread_mutex_unlock(&vhost_user.mutex);
-				goto again;
-			}
-
-			VHOST_LOG_CONFIG(path, INFO, "free connfd %d\n", conn->connfd);
-			close(conn->connfd);
-			vhost_destroy_device(conn->vid);
-			TAILQ_REMOVE(&vsocket->conn_list, conn, next);
-			free(conn);
-		}
-		pthread_mutex_unlock(&vsocket->conn_mutex);
-
-		if (vsocket->is_server) {
-			close(vsocket->socket_fd);
-			unlink(path);
-		}
-
-		pthread_mutex_destroy(&vsocket->conn_mutex);
-		vhost_user_socket_mem_free(vsocket);
-
-		count = --vhost_user.vsocket_cnt;
-		vhost_user.vsockets[i] = vhost_user.vsockets[count];
-		vhost_user.vsockets[count] = NULL;
-		pthread_mutex_unlock(&vhost_user.mutex);
-		return 0;
-	}
-	pthread_mutex_unlock(&vhost_user.mutex);
-
-	return -1;
 }
 
 /*
@@ -1221,6 +1156,138 @@ vhost_driver_callback_get(const char *path)
 	return vsocket ? vsocket->notify_ops : NULL;
 }
 
+static void
+socket_delete_notifier_cb(int fd, void *dat __rte_unused, int *remove __rte_unused)
+{
+	char buf[1];
+	struct vhost_user_socket *vsocket;
+	int count;
+	struct vhost_user_connection *conn, *next;
+	struct virtio_net *dev;
+	int rc;
+
+	rc = read(fd, buf, 1);
+	RTE_SET_USED(rc);
+
+	pthread_mutex_lock(&vhost_user.mutex);
+	for (int i = 0; i < vhost_user.vsocket_cnt; i++) {
+		vsocket = vhost_user.vsockets[i];
+
+		if (!vsocket->delete) {
+			continue;
+		}
+
+		// free all related connections
+		pthread_mutex_lock(&vsocket->conn_mutex);
+		for (conn = TAILQ_FIRST(&vsocket->conn_list);
+		conn != NULL;
+		conn = next) {
+			next = TAILQ_NEXT(conn, next);
+
+			dev = get_device(conn->vid);
+
+			close(conn->connfd);
+
+			if (dev)
+				vhost_destroy_device_notify(dev);
+
+			if (vsocket->notify_ops->destroy_connection)
+				vsocket->notify_ops->destroy_connection(conn->vid);
+
+			vhost_destroy_device(conn->vid);
+
+			TAILQ_REMOVE(&vsocket->conn_list, conn, next);
+
+			free(conn);
+		}
+		pthread_mutex_unlock(&vsocket->conn_mutex);
+
+		// free vsocket
+		if (vsocket->is_server) {
+			close(vsocket->socket_fd);
+			unlink(vsocket->path);
+		}
+		vhost_user_socket_mem_free(vsocket);
+		count = --vhost_user.vsocket_cnt;
+		vhost_user.vsockets[i] = vhost_user.vsockets[count];
+		vhost_user.vsockets[count] = NULL;
+	}
+	pthread_mutex_unlock(&vhost_user.mutex);
+}
+
+static int
+socket_delete_notifier_init(void)
+{
+	if (pipe(vhost_user.socket_delete_notifier.fds) < 0) {
+		return -1;
+	}
+
+	if (fdset_add(&vhost_user.fdset, vhost_user.socket_delete_notifier.readfd, socket_delete_notifier_cb, NULL, NULL) < 0) {
+		return -1;
+	}
+
+	return 0;
+}
+
+static int
+socket_delete_async(struct vhost_user_socket *vsocket)
+{
+	pthread_mutex_lock(&vhost_user.mutex);
+	vsocket->delete = 1;
+	pthread_mutex_unlock(&vhost_user.mutex);
+
+	if (write(vhost_user.socket_delete_notifier.writefd, "1", 1) < 0) {
+		return -1;
+	}
+
+	return 0;
+}
+
+/**
+ * Remove vsocket and related connections.
+ */
+int
+rte_vhost_driver_unregister(const char *path)
+{
+	struct vhost_user_socket *vsocket;
+	struct vhost_user_connection *conn;
+
+	if (pthread_mutex_trylock(&vhost_user.mutex)) {
+		return -EAGAIN;
+	}
+	vsocket = find_vhost_user_socket(path);
+	pthread_mutex_unlock(&vhost_user.mutex);
+
+	if (!vsocket) {
+		return -ENOENT;
+	}
+
+	// Remove vhost_user_server_new_connection callback
+	// from poller to avoid new connections.
+	if (fdset_try_del(&vhost_user.fdset, vsocket->socket_fd) < 0) {
+		return -EAGAIN;
+	}
+
+	// Remove vhost_user_read_cb callback for related connections too.
+	if (pthread_mutex_trylock(&vsocket->conn_mutex)) {
+		return -EAGAIN;
+	}
+	TAILQ_FOREACH(conn, &vsocket->conn_list, next) {
+		if (fdset_try_del(&vhost_user.fdset, conn->connfd) < 0) {
+			pthread_mutex_unlock(&vsocket->conn_mutex);
+			return -EAGAIN;
+		}
+	}
+	pthread_mutex_unlock(&vsocket->conn_mutex);
+
+	// Notify vsocket delete pipe to free vsocket and related connections.
+	if (socket_delete_async(vsocket) < 0) {
+		return -EPIPE;
+	}
+
+	return 0;
+}
+
 int
 rte_vhost_driver_start(const char *path)
 {
@@ -1244,6 +1311,11 @@ rte_vhost_driver_start(const char *path)
 		 */
 		if (fdset_pipe_init(&vhost_user.fdset) < 0) {
 			VHOST_LOG_CONFIG(path, ERR, "failed to create pipe for vhost fdset\n");
+			return -1;
+		}
+
+		if (socket_delete_notifier_init() < 0) {
+			VHOST_LOG_CONFIG(path, ERR, "failed to create pipe for deleting vsockets\n");
 			return -1;
 		}
 
